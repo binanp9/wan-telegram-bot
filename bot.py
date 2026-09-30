@@ -116,7 +116,8 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.chat_data["aspect"] = aspect
     context.chat_data["duration"] = duration
     await update.message.reply_text(f"Saved: {size} · {aspect} · {duration}s")
-  async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return await deny(update)
     chat_id = update.effective_chat.id
