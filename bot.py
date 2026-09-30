@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -120,6 +121,14 @@ def format_task_failure(status) -> str:
     code_l = f"{fail_code} {fail_reason} {message}".lower()
     if "insufficient" in code_l or "overdue" in code_l or "balance" in code_l:
         lines.append("This looks like a Siray billing/balance problem.")
+    try:
+        raw_txt = json.dumps(raw, default=str) if raw else ""
+        if raw_txt:
+            lines.append("raw: " + raw_txt[:1500])
+        else:
+            lines.append(f"status object: {status!r}"[:1500])
+    except Exception:
+        lines.append(f"raw: {raw!r}"[:1500])
     return "\n".join(lines)
 
 
@@ -245,6 +254,32 @@ async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await upload_ref(update, "audios", tg_file, suffix, MAX_AUDIOS)
 
 
+async def lookup_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    if not context.args:
+        await update.message.reply_text("Usage: /task TASK_ID")
+        return
+    task_id = context.args[0].strip()
+    try:
+        status = await asyncio.to_thread(siray.video.query_task, task_id)
+    except Exception as exc:
+        await update.message.reply_text(format_submit_error(exc))
+        return
+    name = (status.status or "").upper()
+    if name in {"FAILURE", "FAILED"}:
+        await update.message.reply_text(format_task_failure(status))
+        return
+    raw = getattr(status, "raw_response", None) or {}
+    try:
+        raw_txt = json.dumps(raw, default=str)[:1500]
+    except Exception:
+        raw_txt = repr(raw)[:1500]
+    await update.message.reply_text(
+        f"status: {status.status}\nprogress: {getattr(status, 'progress', None)}\nraw: {raw_txt}"
+    )
+
+
 async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return await deny(update)
@@ -262,7 +297,7 @@ async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     b = bucket(chat_id)
     busy.add(chat_id)
     await update.message.reply_text(
-        f"Submitting {duration}s {size} {aspect}\n"
+        f"Submitting {duration}s {size} {aspect} · audio on\n"
         f"Model: {MODEL}\n{counts(chat_id)}"
     )
     kwargs = {
@@ -272,7 +307,7 @@ async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "size": size,
         "aspect_ratio": aspect,
         "prompt_expansion_enable": True,
-        "audio_enable": bool(b["audios"]),
+        "audio_enable": True,
     }
     if b["images"]:
         kwargs["images"] = b["images"][:MAX_IMAGES]
@@ -329,6 +364,7 @@ def main() -> None:
     app.add_handler(CommandHandler("clear", clear_refs))
     app.add_handler(CommandHandler("settings", settings))
     app.add_handler(CommandHandler("generate", generate))
+    app.add_handler(CommandHandler("task", lookup_task))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(
         MessageHandler(filters.VIDEO | filters.ANIMATION | filters.Document.VIDEO, on_video)
