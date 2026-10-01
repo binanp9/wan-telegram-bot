@@ -55,9 +55,33 @@ if not TELEGRAM_BOT_TOKEN or not SIRAY_API_KEY:
 
 siray = Siray(api_key=SIRAY_API_KEY)
 
-# chat_id -> {"images": [...], "videos": [...], "audios": [...]}
+DATA_PATH = Path(os.environ.get("BOT_DATA", "/tmp/wan-bot-data.json"))
 refs: dict[int, dict[str, list[str]]] = {}
 busy: set[int] = set()
+pending: dict[int, dict] = {}
+waiting: dict[int, dict] = {}
+blocks: dict[str, dict[str, dict[str, str]]] = {}
+last_jobs: dict[str, dict] = {}
+
+
+def _load_store() -> None:
+    if not DATA_PATH.exists():
+        return
+    try:
+        raw = json.loads(DATA_PATH.read_text())
+    except Exception:
+        log.exception("could not read %s", DATA_PATH)
+        return
+    blocks.update(raw.get("blocks") or {})
+    last_jobs.update(raw.get("last") or {})
+
+
+def _save_store() -> None:
+    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DATA_PATH.write_text(json.dumps({"blocks": blocks, "last": last_jobs}))
+
+
+_load_store()
 
 
 def bucket(chat_id: int) -> dict[str, list[str]]:
@@ -163,13 +187,18 @@ HELP_TEXT = (
     "Wan 3.0 spicy bot\n\n"
     "/model t2v|i2v|r2v — pick endpoint (default r2v)\n"
     "  t2v  prompt only, attachments ignored\n"
-    "  i2v  needs 1 photo (sent as image, not @Image1 text)\n"
+    "  i2v  needs 1 photo\n"
     "  r2v  needs ≥1 photo or video\n"
-    "/generate <prompt>\n"
+    "/g <prompt> — ask to run (y / n)\n"
+    "/again — rerun last prompt; add size aspect duration to override\n"
+    "/last — show last prompt\n"
+    "/block save x — save pasted text, or `all` for the whole last prompt\n"
+    "/blocks — list saved blocks\n"
+    "/block x — print one block\n"
     "/settings 480p 16:9 5\n"
     "/size 480p|720p|1080p\n"
     "/duration 2-30\n"
-    "/refs   /clear   /help   /balance   /task TASK_ID"
+    "/refs   /clear   /help   /howto   /balance   /task TASK_ID"
 )
 
 
@@ -183,6 +212,42 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{MODE_IDS[mode]}\n\n"
         f"Your Telegram user id: {uid}\n\n"
         f"{HELP_TEXT}"
+    )
+
+
+async def howto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    await update.message.reply_text(
+        "How to use this bot\n\n"
+        "Modes\n"
+        "/model t2v — prompt only. Photos are ignored.\n"
+        "/model i2v — needs 1 photo, sent as the start frame.\n"
+        "/model r2v — needs at least one photo or video.\n"
+        "/model — show the current mode.\n\n"
+        "Run a job\n"
+        "/g your scene — does not send yet.\n"
+        "Bot replies with mode, model, settings, ref counts, and prompt.\n"
+        "y or /y sends. n or /n cancels.\n"
+        "If mode is t2v and refs are attached, the confirm warns they will not be sent.\n\n"
+        "Recover a prompt\n"
+        "/last — print the last prompt.\n"
+        "/again — restore its refs and ask to run again.\n"
+        "/again 720p 9:16 8 — same prompt, those settings only.\n"
+        "/again t2v 5 — same prompt, switch mode and duration.\n\n"
+        "Blocks (x is a name you choose)\n"
+        "/block save x — bot asks for text. Paste a slice, or send all for the whole last prompt. Then it asks for a short description.\n"
+        "/block save x all — skip the paste and save the whole last prompt.\n"
+        "/blocks — list names and descriptions.\n"
+        "/block x — print that block.\n"
+        "/block del x — delete it.\n\n"
+        "Settings\n"
+        "/settings 480p 16:9 5\n"
+        "/size 720p\n"
+        "/duration 8\n"
+        "/refs — counts. /clear — drop refs.\n"
+        "/balance — Siray USD. /task id — check a job.\n"
+        "/help — short list. /howto — this guide."
     )
 
 
@@ -415,56 +480,157 @@ async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return await deny(update)
     prompt = " ".join(context.args or []).strip()
     if not prompt:
-        await update.message.reply_text("Usage: /generate your scene description")
+        await update.message.reply_text("Usage: /g your scene description")
         return
+    await offer_job(update, context, prompt, None)
+
+
+def parse_overrides(args: list[str]) -> dict:
+    found: dict = {}
+    for arg in args:
+        low = arg.lower()
+        if low in {"480p", "720p", "1080p"}:
+            found["size"] = low
+        elif low in {"16:9", "9:16", "1:1", "4:3", "3:4", "adaptive"}:
+            found["aspect"] = low
+        elif low.isdigit():
+            found["duration"] = int(low)
+        elif low in MODE_IDS:
+            found["mode"] = low
+    return found
+
+
+async def again(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    chat_id = update.effective_chat.id
+    last = last_jobs.get(str(chat_id))
+    if not last:
+        await update.message.reply_text("No last prompt yet. Run /g first.")
+        return
+    saved_refs = last.get("refs") or {}
+    if any(saved_refs.get(k) for k in ("images", "videos", "audios")):
+        refs[chat_id] = {
+            "images": list(saved_refs.get("images") or []),
+            "videos": list(saved_refs.get("videos") or []),
+            "audios": list(saved_refs.get("audios") or []),
+        }
+    if last.get("mode") in MODE_IDS:
+        context.chat_data["mode"] = last["mode"]
+    await offer_job(update, context, last["prompt"], parse_overrides(context.args or []))
+
+
+async def show_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    last = last_jobs.get(str(update.effective_chat.id))
+    if not last:
+        await update.message.reply_text("No last prompt yet.")
+        return
+    await update.message.reply_text(
+        f"Last prompt ({last.get('mode')} {last.get('duration')}s "
+        f"{last.get('size')} {last.get('aspect')}):\n\n{last.get('prompt')}"
+    )
+
+
+def confirm_text(job: dict) -> str:
+    note = ""
+    images = len(job["refs"]["images"])
+    videos = len(job["refs"]["videos"])
+    audios = len(job["refs"]["audios"])
+    if job["mode"] == "t2v" and (images or videos or audios):
+        note = (
+            "\nMode is t2v, so those refs will NOT be sent. "
+            "Reply n, then /model r2v and /again, to use them."
+        )
+    return (
+        "About to run this prompt.\n"
+        f"mode: {job['mode']}\n"
+        f"model: {job['model_id']}\n"
+        f"settings: {job['duration']}s {job['size']} {job['aspect']}\n"
+        f"refs: images {images}, videos {videos}, audio {audios}\n"
+        f"prompt: {job['prompt'][:500]}\n"
+        f"{note}\n"
+        "Reply y to send, n to cancel."
+    )
+
+
+async def offer_job(update, context, prompt: str, overrides: dict | None) -> None:
     chat_id = update.effective_chat.id
     if chat_id in busy:
         await update.message.reply_text("Already generating. Wait.")
         return
-    size = context.chat_data.get("size", DEFAULT_SIZE)
-    aspect = context.chat_data.get("aspect", DEFAULT_ASPECT)
-    duration = int(context.chat_data.get("duration", DEFAULT_DURATION))
-    mode = get_mode(context)
-    model_id = get_model_id(context)
+    overrides = overrides or {}
+    mode = overrides.get("mode", get_mode(context))
+    size = overrides.get("size", context.chat_data.get("size", DEFAULT_SIZE))
+    aspect = overrides.get("aspect", context.chat_data.get("aspect", DEFAULT_ASPECT))
+    duration = int(overrides.get("duration", context.chat_data.get("duration", DEFAULT_DURATION)))
+    if duration < 2 or duration > 30:
+        await update.message.reply_text("Duration must be 2–30")
+        return
     b = bucket(chat_id)
     if mode == "i2v" and not b["images"]:
-        await update.message.reply_text(
-            "i2v needs 1 photo first. Send a picture, then /generate.\n"
-            "Do not put @Image1 in the prompt — that will not attach a file."
-        )
+        await update.message.reply_text("i2v needs 1 photo first. Nothing was sent.")
         return
     if mode == "r2v" and not b["images"] and not b["videos"]:
-        await update.message.reply_text(
-            "r2v needs at least one photo or video first.\n"
-            "Send media, then /generate. @Image1 in text does not load files."
-        )
+        await update.message.reply_text("r2v needs at least one photo or video. Nothing was sent.")
         return
-    busy.add(chat_id)
-    await update.message.reply_text(
-        f"Submitting {duration}s {size} {aspect} · audio on · expand off\n"
-        f"Mode: {mode}\n{model_id}\n{counts(chat_id)}"
-    )
-    kwargs = {
-        "model": model_id,
+    job = {
         "prompt": prompt,
-        "duration": duration,
+        "mode": mode,
+        "model_id": MODE_IDS[mode],
         "size": size,
-        "aspect_ratio": aspect,
+        "aspect": aspect,
+        "duration": duration,
+        "refs": {
+            "images": list(b["images"]),
+            "videos": list(b["videos"]),
+            "audios": list(b["audios"]),
+        },
+    }
+    pending[chat_id] = job
+    await update.message.reply_text(confirm_text(job))
+
+
+async def submit_pending(update, context) -> None:
+    chat_id = update.effective_chat.id
+    job = pending.pop(chat_id, None)
+    if not job:
+        await update.message.reply_text("Nothing waiting. Use /g or /again.")
+        return
+    if chat_id in busy:
+        await update.message.reply_text("Already generating. Wait.")
+        return
+    context.chat_data["mode"] = job["mode"]
+    context.chat_data["size"] = job["size"]
+    context.chat_data["aspect"] = job["aspect"]
+    context.chat_data["duration"] = job["duration"]
+    last_jobs[str(chat_id)] = job
+    _save_store()
+    busy.add(chat_id)
+    kwargs = {
+        "model": job["model_id"],
+        "prompt": job["prompt"],
+        "duration": job["duration"],
+        "size": job["size"],
+        "aspect_ratio": job["aspect"],
         "prompt_expansion_enable": False,
         "audio_enable": True,
     }
-    if mode == "i2v":
-        kwargs["image"] = b["images"][0]
-        if len(b["images"]) > 1:
-            kwargs["end_image"] = b["images"][1]
-    elif mode == "r2v":
-        if b["images"]:
-            kwargs["images"] = b["images"][:MAX_IMAGES]
-        if b["videos"]:
-            kwargs["videos"] = b["videos"][:MAX_VIDEOS]
-        if b["audios"]:
-            kwargs["audios"] = b["audios"][:MAX_AUDIOS]
-    # t2v: prompt only — do not attach files even if they are stored
+    if job["mode"] == "i2v":
+        kwargs["image"] = job["refs"]["images"][0]
+        if len(job["refs"]["images"]) > 1:
+            kwargs["end_image"] = job["refs"]["images"][1]
+    elif job["mode"] == "r2v":
+        if job["refs"]["images"]:
+            kwargs["images"] = job["refs"]["images"][:MAX_IMAGES]
+        if job["refs"]["videos"]:
+            kwargs["videos"] = job["refs"]["videos"][:MAX_VIDEOS]
+        if job["refs"]["audios"]:
+            kwargs["audios"] = job["refs"]["audios"][:MAX_AUDIOS]
+    await update.message.reply_text(
+        f"Submitting {job['duration']}s {job['size']} {job['aspect']} · {job['mode']}"
+    )
     try:
         response = await asyncio.to_thread(siray.video.generate_async, **kwargs)
         task_id = response.task_id
@@ -475,6 +641,118 @@ async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(f"Queued.\nTask: {task_id}")
     context.application.create_task(poll_and_send(context.application, chat_id, task_id))
+
+
+async def confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    await submit_pending(update, context)
+
+
+async def confirm_no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    pending.pop(update.effective_chat.id, None)
+    await update.message.reply_text("Cancelled. Last prompt is still available with /last.")
+
+
+async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    chat_key = str(update.effective_chat.id)
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage:\n/blocks\n/block save face\n/block save face all\n/block face\n/block del face"
+        )
+        return
+    if args[0] == "save":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /block save face")
+            return
+        name = args[1].lower()
+        if len(args) > 2 and args[2] == "all":
+            last = last_jobs.get(chat_key)
+            if not last:
+                await update.message.reply_text("No last prompt to save.")
+                return
+            waiting[update.effective_chat.id] = {
+                "kind": "desc",
+                "name": name,
+                "text": last["prompt"],
+            }
+            await update.message.reply_text("Short description for this block?")
+            return
+        waiting[update.effective_chat.id] = {"kind": "text", "name": name}
+        await update.message.reply_text(
+            "Send the text to save.\n"
+            "Send all to save the whole last prompt.\n"
+            "Send cancel to stop."
+        )
+        return
+    if args[0] == "del" and len(args) > 1:
+        blocks.get(chat_key, {}).pop(args[1].lower(), None)
+        _save_store()
+        await update.message.reply_text(f"Deleted {args[1].lower()}.")
+        return
+    item = blocks.get(chat_key, {}).get(args[0].lower())
+    if not item:
+        await update.message.reply_text("No block with that name. /blocks to list.")
+        return
+    await update.message.reply_text(f"{args[0].lower()} — {item.get('desc')}\n\n{item.get('text')}")
+
+
+async def list_blocks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    owned = blocks.get(str(update.effective_chat.id), {})
+    if not owned:
+        await update.message.reply_text("No blocks saved.")
+        return
+    lines = [f"{name} — {item.get('desc') or 'no description'}" for name, item in owned.items()]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update) or not update.message or not update.message.text:
+        return
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+    low = text.lower()
+    wait = waiting.get(chat_id)
+    if wait:
+        if low == "cancel":
+            waiting.pop(chat_id, None)
+            await update.message.reply_text("Block save cancelled.")
+            return
+        if wait["kind"] == "text":
+            if low == "all":
+                last = last_jobs.get(str(chat_id))
+                if not last:
+                    await update.message.reply_text("No last prompt. Paste the text instead.")
+                    return
+                body = last["prompt"]
+            else:
+                body = text
+            waiting[chat_id] = {"kind": "desc", "name": wait["name"], "text": body}
+            await update.message.reply_text("Short description for this block?")
+            return
+        if wait["kind"] == "desc":
+            chat_key = str(chat_id)
+            blocks.setdefault(chat_key, {})[wait["name"]] = {
+                "text": wait["text"],
+                "desc": text[:80],
+            }
+            waiting.pop(chat_id, None)
+            _save_store()
+            await update.message.reply_text(f"Saved block {wait['name']}.")
+            return
+    if chat_id in pending and low in {"y", "yes", "n", "no"}:
+        if low in {"y", "yes"}:
+            await submit_pending(update, context)
+        else:
+            pending.pop(chat_id, None)
+            await update.message.reply_text("Cancelled. Last prompt is still available with /last.")
 
 
 async def poll_and_send(app, chat_id: int, task_id: str) -> None:
@@ -510,6 +788,7 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("howto", howto))
     app.add_handler(CommandHandler("balance", show_balance))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("refs", show_refs))
@@ -517,7 +796,14 @@ def main() -> None:
     app.add_handler(CommandHandler("settings", settings))
     app.add_handler(CommandHandler("size", set_size))
     app.add_handler(CommandHandler("duration", set_duration))
+    app.add_handler(CommandHandler("g", generate))
     app.add_handler(CommandHandler("generate", generate))
+    app.add_handler(CommandHandler("again", again))
+    app.add_handler(CommandHandler("last", show_last))
+    app.add_handler(CommandHandler("block", block_cmd))
+    app.add_handler(CommandHandler("blocks", list_blocks))
+    app.add_handler(CommandHandler("y", confirm_yes))
+    app.add_handler(CommandHandler("n", confirm_no))
     app.add_handler(CommandHandler("task", lookup_task))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(
@@ -526,6 +812,7 @@ def main() -> None:
     app.add_handler(
         MessageHandler(filters.AUDIO | filters.VOICE | filters.Document.AUDIO, on_audio)
     )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     log.info("Bot polling…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
