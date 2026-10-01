@@ -37,10 +37,31 @@ ALLOWED = {
 
 MODEL = os.environ.get("SIRAY_MODEL", "alibaba/wan-3.0-ref2v-spicy")
 DEFAULT_MODE = "r2v"
-MODE_IDS = {
-    "t2v": "alibaba/wan-3.0-t2v-spicy",
-    "i2v": "alibaba/wan-3.0-i2v-spicy",
-    "r2v": "alibaba/wan-3.0-ref2v-spicy",
+MODELS = {
+    "t2v": {"id": "alibaba/wan-3.0-t2v-spicy", "kind": "video", "needs": "none"},
+    "i2v": {"id": "alibaba/wan-3.0-i2v-spicy", "kind": "video", "needs": "image"},
+    "r2v": {"id": "alibaba/wan-3.0-ref2v-spicy", "kind": "video", "needs": "ref"},
+    "sd25r2v": {"id": "bytedance/seedance-2.5-ref2v-spicy", "kind": "video", "needs": "ref"},
+    "sd5i2i": {"id": "bytedance/seedream-5.0-pro-i2i-spicy", "kind": "image", "needs": "image"},
+    "sd5t2i": {"id": "bytedance/seedream-5.0-pro-t2i-spicy", "kind": "image", "needs": "none"},
+    "sd45r2i": {"id": "bytedance/seedream-4.5-ref2i-spicy", "kind": "image", "needs": "ref"},
+    "sd45t2i": {"id": "bytedance/seedream-4.5-t2i-spicy", "kind": "image", "needs": "none"},
+}
+MODE_ALIASES = {
+    "sd25": "sd25r2v",
+    "sd5e": "sd5i2i",
+    "sd5t": "sd5t2i",
+    "sd45r": "sd45r2i",
+    "sd45t": "sd45t2i",
+}
+MODE_IDS = {name: spec["id"] for name, spec in MODELS.items()}
+IMAGE_SIZES = {
+    "1:1": "1024x1024",
+    "16:9": "1424x800",
+    "9:16": "800x1424",
+    "4:3": "1152x864",
+    "3:4": "864x1152",
+    "adaptive": "1024x1024",
 }
 DEFAULT_SIZE = os.environ.get("DEFAULT_SIZE", "480p")
 DEFAULT_ASPECT = os.environ.get("DEFAULT_ASPECT", "16:9")
@@ -176,7 +197,8 @@ def format_submit_error(exc: Exception) -> str:
 
 def get_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
     mode = str(context.chat_data.get("mode", DEFAULT_MODE)).lower()
-    return mode if mode in MODE_IDS else DEFAULT_MODE
+    mode = MODE_ALIASES.get(mode, mode)
+    return mode if mode in MODELS else DEFAULT_MODE
 
 
 def get_model_id(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -185,10 +207,13 @@ def get_model_id(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 HELP_TEXT = (
     "Wan 3.0 spicy bot\n\n"
-    "/model t2v|i2v|r2v — pick endpoint (default r2v)\n"
-    "  t2v  prompt only, attachments ignored\n"
-    "  i2v  needs 1 photo\n"
-    "  r2v  needs ≥1 photo or video\n"
+    "/model t2v|i2v|r2v|sd25r2v|sd5i2i|sd5t2i|sd45r2i|sd45t2i\n"
+    "  t2v i2v r2v — Wan 3.0 spicy video\n"
+    "  sd25r2v — Seedance 2.5 ref2v spicy\n"
+    "  sd5i2i — Seedream 5.0 Pro edit spicy\n"
+    "  sd5t2i — Seedream 5.0 Pro t2i spicy\n"
+    "  sd45r2i — Seedream 4.5 ref2i spicy\n"
+    "  sd45t2i — Seedream 4.5 t2i spicy\n"
     "/g <prompt> — ask to run (y / n)\n"
     "/again — rerun last prompt; add size aspect duration to override\n"
     "/last — show last prompt\n"
@@ -221,9 +246,14 @@ async def howto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "How to use this bot\n\n"
         "Modes\n"
-        "/model t2v — prompt only. Photos are ignored.\n"
-        "/model i2v — needs 1 photo, sent as the start frame.\n"
-        "/model r2v — needs at least one photo or video.\n"
+        "/model t2v — Wan video, prompt only. Photos are ignored.\n"
+        "/model i2v — Wan video, needs 1 photo.\n"
+        "/model r2v — Wan video, needs a photo or video.\n"
+        "/model sd25r2v — Seedance 2.5 ref2v spicy, needs a photo or video.\n"
+        "/model sd5i2i — Seedream 5.0 Pro edit, needs a photo, returns an image.\n"
+        "/model sd5t2i — Seedream 5.0 Pro text-to-image, prompt only.\n"
+        "/model sd45r2i — Seedream 4.5 ref-to-image, needs a photo.\n"
+        "/model sd45t2i — Seedream 4.5 text-to-image, prompt only.\n"
         "/model — show the current mode.\n\n"
         "Run a job\n"
         "/g your scene — does not send yet.\n"
@@ -266,20 +296,15 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     args = [a.lower() for a in (context.args or [])]
     if args:
         raw = args[0].replace("ref2v", "r2v")
-        if raw not in MODE_IDS:
-            await update.message.reply_text("Use /model t2v, /model i2v, or /model r2v")
+        raw = MODE_ALIASES.get(raw, raw)
+        if raw not in MODELS:
+            await update.message.reply_text(
+                "Use /model t2v, i2v, r2v, sd25r2v, sd5i2i, sd5t2i, sd45r2i, or sd45t2i"
+            )
             return
         context.chat_data["mode"] = raw
-        extra = ""
-        if raw == "t2v":
-            extra = "\nAttachments will be ignored on /generate."
-        elif raw == "i2v":
-            extra = "\nSend exactly 1 photo before /generate."
-        else:
-            extra = "\nSend at least one photo or video before /generate."
-        await update.message.reply_text(
-            f"Mode: {raw}\n{MODE_IDS[raw]}{extra}"
-        )
+        spec = MODELS[raw]
+        await update.message.reply_text(f"Mode: {raw}\n{spec['id']}\nneeds: {spec['needs']}")
         return
     mode = get_mode(context)
     await update.message.reply_text(f"Mode: {mode}\n{MODE_IDS[mode]}")
@@ -495,8 +520,8 @@ def parse_overrides(args: list[str]) -> dict:
             found["aspect"] = low
         elif low.isdigit():
             found["duration"] = int(low)
-        elif low in MODE_IDS:
-            found["mode"] = low
+        elif low in MODE_IDS or low in MODE_ALIASES:
+            found["mode"] = MODE_ALIASES.get(low, low)
     return found
 
 
@@ -562,23 +587,26 @@ async def offer_job(update, context, prompt: str, overrides: dict | None) -> Non
         return
     overrides = overrides or {}
     mode = overrides.get("mode", get_mode(context))
+    spec = MODELS[mode]
     size = overrides.get("size", context.chat_data.get("size", DEFAULT_SIZE))
     aspect = overrides.get("aspect", context.chat_data.get("aspect", DEFAULT_ASPECT))
     duration = int(overrides.get("duration", context.chat_data.get("duration", DEFAULT_DURATION)))
-    if duration < 2 or duration > 30:
+    if spec["kind"] == "video" and duration not in {-1} and (duration < 2 or duration > 30):
         await update.message.reply_text("Duration must be 2–30")
         return
     b = bucket(chat_id)
-    if mode == "i2v" and not b["images"]:
-        await update.message.reply_text("i2v needs 1 photo first. Nothing was sent.")
+    if spec["needs"] == "image" and not b["images"]:
+        await update.message.reply_text(f"{mode} needs 1 photo first. Nothing was sent.")
         return
-    if mode == "r2v" and not b["images"] and not b["videos"]:
-        await update.message.reply_text("r2v needs at least one photo or video. Nothing was sent.")
+    if spec["needs"] == "ref" and not b["images"] and not b["videos"]:
+        await update.message.reply_text(f"{mode} needs at least one photo or video. Nothing was sent.")
         return
     job = {
         "prompt": prompt,
         "mode": mode,
-        "model_id": MODE_IDS[mode],
+        "model_id": spec["id"],
+        "kind": spec["kind"],
+        "needs": spec["needs"],
         "size": size,
         "aspect": aspect,
         "duration": duration,
@@ -611,28 +639,40 @@ async def submit_pending(update, context) -> None:
     kwargs = {
         "model": job["model_id"],
         "prompt": job["prompt"],
-        "duration": job["duration"],
-        "size": job["size"],
-        "aspect_ratio": job["aspect"],
-        "prompt_expansion_enable": False,
-        "audio_enable": True,
     }
-    if job["mode"] == "i2v":
-        kwargs["image"] = job["refs"]["images"][0]
-        if len(job["refs"]["images"]) > 1:
-            kwargs["end_image"] = job["refs"]["images"][1]
-    elif job["mode"] == "r2v":
-        if job["refs"]["images"]:
+    if job["kind"] == "image":
+        kwargs["size"] = image_size_for(job["aspect"])
+        kwargs["output_format"] = "jpg"
+        if job["needs"] != "none" and job["refs"]["images"]:
             kwargs["images"] = job["refs"]["images"][:MAX_IMAGES]
-        if job["refs"]["videos"]:
-            kwargs["videos"] = job["refs"]["videos"][:MAX_VIDEOS]
-        if job["refs"]["audios"]:
-            kwargs["audios"] = job["refs"]["audios"][:MAX_AUDIOS]
-    await update.message.reply_text(
-        f"Submitting {job['duration']}s {job['size']} {job['aspect']} · {job['mode']}"
-    )
+        runner = siray.image.generate_async
+    else:
+        kwargs.update(
+            {
+                "duration": job["duration"],
+                "size": job["size"] if job["size"] in {"480p", "720p", "1080p"} else "480p",
+                "aspect_ratio": job["aspect"],
+                "audio_enable": True,
+            }
+        )
+        if job["mode"].startswith("t2v") or job["needs"] == "none":
+            pass
+        elif job["needs"] == "image" and job["mode"] == "i2v":
+            kwargs["image"] = job["refs"]["images"][0]
+            if len(job["refs"]["images"]) > 1:
+                kwargs["end_image"] = job["refs"]["images"][1]
+        else:
+            if job["refs"]["images"]:
+                kwargs["images"] = job["refs"]["images"][:MAX_IMAGES]
+            if job["refs"]["videos"]:
+                kwargs["videos"] = job["refs"]["videos"][:MAX_VIDEOS]
+            if job["refs"]["audios"]:
+                kwargs["audios"] = job["refs"]["audios"][:MAX_AUDIOS]
+        runner = siray.video.generate_async
+    label = kwargs.get("size", job["size"])
+    await update.message.reply_text(f"Submitting {job['mode']} · {label}")
     try:
-        response = await asyncio.to_thread(siray.video.generate_async, **kwargs)
+        response = await asyncio.to_thread(runner, **kwargs)
         task_id = response.task_id
     except Exception as exc:
         busy.discard(chat_id)
@@ -640,7 +680,9 @@ async def submit_pending(update, context) -> None:
         await update.message.reply_text(format_submit_error(exc))
         return
     await update.message.reply_text(f"Queued.\nTask: {task_id}")
-    context.application.create_task(poll_and_send(context.application, chat_id, task_id))
+    context.application.create_task(
+        poll_and_send(context.application, chat_id, task_id, job["kind"])
+    )
 
 
 async def confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -755,12 +797,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Cancelled. Last prompt is still available with /last.")
 
 
-async def poll_and_send(app, chat_id: int, task_id: str) -> None:
+async def poll_and_send(app, chat_id: int, task_id: str, kind: str = "video") -> None:
+    query = siray.image.query_task if kind == "image" else siray.video.query_task
     try:
         for _ in range(240):
             await asyncio.sleep(5)
             try:
-                status = await asyncio.to_thread(siray.video.query_task, task_id)
+                status = await asyncio.to_thread(query, task_id)
             except Exception as exc:
                 log.warning("poll error: %s", exc)
                 continue
@@ -772,7 +815,10 @@ async def poll_and_send(app, chat_id: int, task_id: str) -> None:
                     return
                 url = urls[0]
                 try:
-                    await app.bot.send_video(chat_id, video=url, caption="Done.")
+                    if kind == "image":
+                        await app.bot.send_photo(chat_id, photo=url, caption="Done.")
+                    else:
+                        await app.bot.send_video(chat_id, video=url, caption="Done.")
                 except Exception:
                     await app.bot.send_message(chat_id, f"Done:\n{url}")
                 return
