@@ -169,7 +169,7 @@ HELP_TEXT = (
     "/settings 480p 16:9 5\n"
     "/size 480p|720p|1080p\n"
     "/duration 2-30\n"
-    "/refs   /clear   /help   /task TASK_ID"
+    "/refs   /clear   /help   /balance   /task TASK_ID"
 )
 
 
@@ -218,6 +218,46 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     mode = get_mode(context)
     await update.message.reply_text(f"Mode: {mode}\n{MODE_IDS[mode]}")
+
+
+def fetch_balance() -> dict:
+    client = getattr(siray, "_base_client", None)
+    if client is not None and hasattr(client, "get"):
+        return client.get("/v1/account/balance")
+    import urllib.request
+
+    req = urllib.request.Request(
+        "https://api.siray.ai/v1/account/balance",
+        headers={"Authorization": f"Bearer {SIRAY_API_KEY}"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    try:
+        payload = await asyncio.to_thread(fetch_balance)
+    except Exception as exc:
+        await update.message.reply_text(f"Balance lookup failed: {exc}")
+        return
+    data = payload.get("data", payload) if isinstance(payload, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    avail = data.get("available_balance", data.get("balance", "?"))
+    cash = data.get("balance", "?")
+    coupon = data.get("coupon_balance", "0")
+    frozen = data.get("frozen_balance", "0")
+    await update.message.reply_text(
+        "Siray balance (USD)\n"
+        f"available: ${avail}\n"
+        f"wallet: ${cash}\n"
+        f"coupons: ${coupon}\n"
+        f"frozen: ${frozen}\n"
+        "available = wallet + coupons − frozen"
+    )
 
 
 async def show_refs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -470,6 +510,7 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("balance", show_balance))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("refs", show_refs))
     app.add_handler(CommandHandler("clear", clear_refs))
