@@ -36,6 +36,12 @@ ALLOWED = {
 }
 
 MODEL = os.environ.get("SIRAY_MODEL", "alibaba/wan-3.0-ref2v-spicy")
+DEFAULT_MODE = "r2v"
+MODE_IDS = {
+    "t2v": "alibaba/wan-3.0-t2v-spicy",
+    "i2v": "alibaba/wan-3.0-i2v-spicy",
+    "r2v": "alibaba/wan-3.0-ref2v-spicy",
+}
 DEFAULT_SIZE = os.environ.get("DEFAULT_SIZE", "480p")
 DEFAULT_ASPECT = os.environ.get("DEFAULT_ASPECT", "16:9")
 DEFAULT_DURATION = int(os.environ.get("DEFAULT_DURATION", "5"))
@@ -144,27 +150,74 @@ def format_submit_error(exc: Exception) -> str:
     return "\n".join(parts)
 
 
+def get_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    mode = str(context.chat_data.get("mode", DEFAULT_MODE)).lower()
+    return mode if mode in MODE_IDS else DEFAULT_MODE
+
+
+def get_model_id(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return MODE_IDS[get_mode(context)]
+
+
+HELP_TEXT = (
+    "Wan 3.0 spicy bot\n\n"
+    "/model t2v|i2v|r2v — pick endpoint (default r2v)\n"
+    "  t2v  prompt only, attachments ignored\n"
+    "  i2v  needs 1 photo (sent as image, not @Image1 text)\n"
+    "  r2v  needs ≥1 photo or video\n"
+    "/generate <prompt>\n"
+    "/settings 480p 16:9 5\n"
+    "/size 480p|720p|1080p\n"
+    "/duration 2-30\n"
+    "/refs   /clear   /help   /task TASK_ID"
+)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return await deny(update)
     uid = update.effective_user.id if update.effective_user else "?"
+    mode = get_mode(context)
     await update.message.reply_text(
-        "Wan 3.0 ref2v bot ready.\n\n"
+        f"Wan 3.0 spicy bot ready. Mode: {mode}\n"
+        f"{MODE_IDS[mode]}\n\n"
         f"Your Telegram user id: {uid}\n\n"
-        "Send media first (optional), then a prompt:\n"
-        "• photos → images[]\n"
-        "• videos → videos[]\n"
-        "• voice / audio files → audios[]\n\n"
-        "/generate a woman walking through neon rain\n"
-        "/settings 480p 16:9 5\n"
-        "/refs   /clear   /model"
+        f"{HELP_TEXT}"
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    mode = get_mode(context)
+    await update.message.reply_text(
+        f"{HELP_TEXT}\n\nCurrent: {mode}\n{MODE_IDS[mode]}"
     )
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return await deny(update)
-    await update.message.reply_text(f"Model: {MODEL}")
+    args = [a.lower() for a in (context.args or [])]
+    if args:
+        raw = args[0].replace("ref2v", "r2v")
+        if raw not in MODE_IDS:
+            await update.message.reply_text("Use /model t2v, /model i2v, or /model r2v")
+            return
+        context.chat_data["mode"] = raw
+        extra = ""
+        if raw == "t2v":
+            extra = "\nAttachments will be ignored on /generate."
+        elif raw == "i2v":
+            extra = "\nSend exactly 1 photo before /generate."
+        else:
+            extra = "\nSend at least one photo or video before /generate."
+        await update.message.reply_text(
+            f"Mode: {raw}\n{MODE_IDS[raw]}{extra}"
+        )
+        return
+    mode = get_mode(context)
+    await update.message.reply_text(f"Mode: {mode}\n{MODE_IDS[mode]}")
 
 
 async def show_refs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -202,6 +255,43 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.chat_data["aspect"] = aspect
     context.chat_data["duration"] = duration
     await update.message.reply_text(f"Saved: {size} · {aspect} · {duration}s")
+
+
+async def set_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    if not context.args:
+        await update.message.reply_text(
+            f"Size: {context.chat_data.get('size', DEFAULT_SIZE)}\nUsage: /size 480p"
+        )
+        return
+    size = context.args[0]
+    if size not in {"480p", "720p", "1080p"}:
+        await update.message.reply_text("Size must be 480p, 720p, or 1080p")
+        return
+    context.chat_data["size"] = size
+    await update.message.reply_text(f"Size: {size}")
+
+
+async def set_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    if not context.args:
+        await update.message.reply_text(
+            f"Duration: {context.chat_data.get('duration', DEFAULT_DURATION)}s\n"
+            "Usage: /duration 8"
+        )
+        return
+    try:
+        duration = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Duration must be an integer 2–30")
+        return
+    if duration < 2 or duration > 30:
+        await update.message.reply_text("Duration must be 2–30")
+        return
+    context.chat_data["duration"] = duration
+    await update.message.reply_text(f"Duration: {duration}s")
 
 
 async def upload_ref(update: Update, kind: str, tg_file, suffix: str, limit: int) -> None:
@@ -294,27 +384,47 @@ async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     size = context.chat_data.get("size", DEFAULT_SIZE)
     aspect = context.chat_data.get("aspect", DEFAULT_ASPECT)
     duration = int(context.chat_data.get("duration", DEFAULT_DURATION))
+    mode = get_mode(context)
+    model_id = get_model_id(context)
     b = bucket(chat_id)
+    if mode == "i2v" and not b["images"]:
+        await update.message.reply_text(
+            "i2v needs 1 photo first. Send a picture, then /generate.\n"
+            "Do not put @Image1 in the prompt — that will not attach a file."
+        )
+        return
+    if mode == "r2v" and not b["images"] and not b["videos"]:
+        await update.message.reply_text(
+            "r2v needs at least one photo or video first.\n"
+            "Send media, then /generate. @Image1 in text does not load files."
+        )
+        return
     busy.add(chat_id)
     await update.message.reply_text(
-        f"Submitting {duration}s {size} {aspect} · audio on\n"
-        f"Model: {MODEL}\n{counts(chat_id)}"
+        f"Submitting {duration}s {size} {aspect} · audio on · expand off\n"
+        f"Mode: {mode}\n{model_id}\n{counts(chat_id)}"
     )
     kwargs = {
-        "model": MODEL,
+        "model": model_id,
         "prompt": prompt,
         "duration": duration,
         "size": size,
         "aspect_ratio": aspect,
-        "prompt_expansion_enable": True,
+        "prompt_expansion_enable": False,
         "audio_enable": True,
     }
-    if b["images"]:
-        kwargs["images"] = b["images"][:MAX_IMAGES]
-    if b["videos"]:
-        kwargs["videos"] = b["videos"][:MAX_VIDEOS]
-    if b["audios"]:
-        kwargs["audios"] = b["audios"][:MAX_AUDIOS]
+    if mode == "i2v":
+        kwargs["image"] = b["images"][0]
+        if len(b["images"]) > 1:
+            kwargs["end_image"] = b["images"][1]
+    elif mode == "r2v":
+        if b["images"]:
+            kwargs["images"] = b["images"][:MAX_IMAGES]
+        if b["videos"]:
+            kwargs["videos"] = b["videos"][:MAX_VIDEOS]
+        if b["audios"]:
+            kwargs["audios"] = b["audios"][:MAX_AUDIOS]
+    # t2v: prompt only — do not attach files even if they are stored
     try:
         response = await asyncio.to_thread(siray.video.generate_async, **kwargs)
         task_id = response.task_id
@@ -359,10 +469,13 @@ async def poll_and_send(app, chat_id: int, task_id: str) -> None:
 def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("refs", show_refs))
     app.add_handler(CommandHandler("clear", clear_refs))
     app.add_handler(CommandHandler("settings", settings))
+    app.add_handler(CommandHandler("size", set_size))
+    app.add_handler(CommandHandler("duration", set_duration))
     app.add_handler(CommandHandler("generate", generate))
     app.add_handler(CommandHandler("task", lookup_task))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
