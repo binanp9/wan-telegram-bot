@@ -128,7 +128,9 @@ def counts(chat_id: int) -> str:
     return (
         f"Images: {len(b['images'])}/{MAX_IMAGES}\n"
         f"Videos: {len(b['videos'])}/{MAX_VIDEOS}\n"
-        f"Audio: {len(b['audios'])}/{MAX_AUDIOS}"
+        f"Audio: {len(b['audios'])}/{MAX_AUDIOS}\n"
+        "Remove one: /drop image 2\n"
+        "Preview one: /ref image 2"
     )
 
 
@@ -353,7 +355,73 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def show_refs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return await deny(update)
-    await update.message.reply_text(counts(update.effective_chat.id))
+    b = bucket(update.effective_chat.id)
+    lines = [counts(update.effective_chat.id), ""]
+    for kind, label in (("images", "Image"), ("videos", "Video"), ("audios", "Audio")):
+        for i, _url in enumerate(b[kind], start=1):
+            lines.append(f"{label} {i}")
+    if len(lines) == 2:
+        lines.append("No refs saved.")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def drop_ref(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    args = [a.lower() for a in (context.args or [])]
+    kinds = {
+        "image": "images",
+        "images": "images",
+        "video": "videos",
+        "videos": "videos",
+        "audio": "audios",
+        "audios": "audios",
+    }
+    if len(args) < 2 or args[0] not in kinds or not args[1].isdigit():
+        await update.message.reply_text("Usage: /drop image 2")
+        return
+    kind = kinds[args[0]]
+    index = int(args[1]) - 1
+    saved = bucket(update.effective_chat.id)[kind]
+    if index < 0 or index >= len(saved):
+        await update.message.reply_text(f"No {args[0]} {args[1]}. /refs to list.")
+        return
+    saved.pop(index)
+    await update.message.reply_text(f"Removed {args[0]} {args[1]}.\n{counts(update.effective_chat.id)}")
+
+
+async def preview_ref(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return await deny(update)
+    args = [a.lower() for a in (context.args or [])]
+    kinds = {
+        "image": "images",
+        "images": "images",
+        "video": "videos",
+        "videos": "videos",
+        "audio": "audios",
+        "audios": "audios",
+    }
+    if len(args) < 2 or args[0] not in kinds or not args[1].isdigit():
+        await update.message.reply_text("Usage: /ref image 2")
+        return
+    kind = kinds[args[0]]
+    index = int(args[1]) - 1
+    saved = bucket(update.effective_chat.id)[kind]
+    if index < 0 or index >= len(saved):
+        await update.message.reply_text(f"No {args[0]} {args[1]}. /refs to list.")
+        return
+    url = saved[index]
+    caption = f"{args[0]} {args[1]}"
+    try:
+        if kind == "images":
+            await update.message.reply_photo(url, caption=caption)
+        elif kind == "videos":
+            await update.message.reply_video(url, caption=caption)
+        else:
+            await update.message.reply_audio(url, caption=caption)
+    except Exception:
+        await update.message.reply_text(f"{caption}\n{url}")
 
 
 async def clear_refs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -529,7 +597,7 @@ async def again(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return await deny(update)
     chat_id = update.effective_chat.id
-    last = last_jobs.get(str(chat_id))
+    last = pending.get(chat_id) or last_jobs.get(str(chat_id))
     if not last:
         await update.message.reply_text("No last prompt yet. Run /g first.")
         return
@@ -540,8 +608,6 @@ async def again(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "videos": list(saved_refs.get("videos") or []),
             "audios": list(saved_refs.get("audios") or []),
         }
-    if last.get("mode") in MODE_IDS:
-        context.chat_data["mode"] = last["mode"]
     await offer_job(update, context, last["prompt"], parse_overrides(context.args or []))
 
 
@@ -617,6 +683,8 @@ async def offer_job(update, context, prompt: str, overrides: dict | None) -> Non
         },
     }
     pending[chat_id] = job
+    last_jobs[str(chat_id)] = job
+    _save_store()
     await update.message.reply_text(confirm_text(job))
 
 
@@ -838,6 +906,8 @@ def main() -> None:
     app.add_handler(CommandHandler("balance", show_balance))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("refs", show_refs))
+    app.add_handler(CommandHandler("ref", preview_ref))
+    app.add_handler(CommandHandler("drop", drop_ref))
     app.add_handler(CommandHandler("clear", clear_refs))
     app.add_handler(CommandHandler("settings", settings))
     app.add_handler(CommandHandler("size", set_size))
